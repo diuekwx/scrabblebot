@@ -317,6 +317,16 @@ test("the quality profile can hold a cheap early long word", () => {
   assert.equal(choosePlays(fullLexicon, late, PROFILES.quality!)[0]?.text.length, 7);
 });
 
+test("the holdRack profile holds a long word until 8 tiles or auction 40", () => {
+  const holdRack = PROFILES.holdRack!;
+  // 7 tiles at auction 18: hold.
+  assert.equal(choosePlays(fullLexicon, view("AEMNOTT", 50, 60), holdRack).length, 0);
+  // 8 tiles: play a 7-letter word.
+  assert.equal(choosePlays(fullLexicon, view("AEMNOTTS", 50, 60), holdRack)[0]?.text.length, 7);
+  // Auction 40 (28 left): play with 7.
+  assert.equal(choosePlays(fullLexicon, view("AEMNOTT", 28, 60), holdRack)[0]?.text.length, 7);
+});
+
 test("no chase bids when the rack already spells enough", () => {
   // EEFLSY spells FLEYS (+22): playing it closes a 9-point gap.
   const scores = { mine: 87, others: [96] };

@@ -114,6 +114,12 @@ export interface Params {
   // averaged ~4th place; over 50, ~2nd.
   cheapLongReward: number;
   cheapLongLeft: number;
+  // With more than `holdLongLeft` auctions left, a 7+ letter word waits
+  // until the rack holds `holdLongRack` tiles (0: off), as bro and Ambees
+  // do: neither plays before auction 17, and both sit on 8-9 tiles through
+  // mid-match, against coconut's ~4.4 (live matches 8333-12447).
+  holdLongRack: number;
+  holdLongLeft: number;
   // A wanted letter bid at `focusFrom` or more of its market price, but
   // under it, is raised to market + 1 (0: off). Mid-match the bot lost a
   // quarter of the auctions it bid on by 2 coins or less.
@@ -220,6 +226,8 @@ export const DEFAULT_PARAMS: Params = {
   endgameTarget: 8,
   cheapLongReward: 0,
   cheapLongLeft: 30,
+  holdLongRack: 0,
+  holdLongLeft: 28,
   focusFrom: 0,
   firstPriceShade: 0,
   firstPriceExcess: 0.35,
@@ -246,6 +254,9 @@ export const PROFILES: Readonly<Record<string, Params>> = {
   quality: { ...DEFAULT_PARAMS, cheapLongReward: 36 },
   focus: { ...DEFAULT_PARAMS, focusFrom: 0.6 },
   qualityFocus: { ...DEFAULT_PARAMS, cheapLongReward: 36, focusFrom: 0.6 },
+  // On test: hold 7+ letter words until the rack has 8 tiles or auction 40
+  // of 68 has opened.
+  holdRack: { ...DEFAULT_PARAMS, holdLongRack: 8 },
   // For the tournament: current, plus shaded bids in first-price auctions
   // and endgames played for what each stage scores. Over 60 simulated
   // first-price games current scored 70.8 (89.9 when second-price); shading
@@ -586,6 +597,13 @@ function choosePlay(
   // they'd cost to buy back: a tile kept saves a purchase. (Comparing
   // full outlooks of the leftovers instead once held a bid back 421 ms.)
   const long = words.filter((w) => w.text.length >= 7);
+  if (
+    long.length > 0 &&
+    total(view.rack) < params.holdLongRack &&
+    view.auctionsLeft > params.holdLongLeft
+  ) {
+    return undefined;
+  }
   if (long.length > 0) {
     const ppc = pointsPerCoin(view, params);
     let best = long[0]!;
