@@ -36,6 +36,9 @@ export interface Params {
   // A rack shorter than this plans enough buys, over enough auctions, to
   // reach a word this long (0: plan only `maxBuys`).
   buildTo: number;
+  // While rebuilding that way, a coin counts as at most this many points
+  // (0: no cap; see `pointsPerCoin`).
+  rebuildPointsPerCoin: number;
   // How much more a word is worth for each share of the match still to
   // come: its reward comes back as coins that buy more tiles, which a word
   // finished on the last auction can't do. 0.4 makes a word at the start
@@ -160,9 +163,10 @@ export const DEFAULT_PARAMS: Params = {
   maxBuys: 3,
   coinsPerBuy: 0,
   buildTo: 7,
+  rebuildPointsPerCoin: 0,
   reinvest: 0,
   speculativeCap: 1,
-  lateSpecWindow: 15,
+  lateSpecWindow: 6,
   tilePace: 15,
   tilePaceBoost: 0.3,
   boostFrom: 49,
@@ -182,7 +186,7 @@ export const DEFAULT_PARAMS: Params = {
   cashInBalance: 25,
   cashInReward: 15,
   playSamples: 30,
-  chaseWindow: 8,
+  chaseWindow: 12,
   chaseShares: [1, 0.6, 0.35],
   chaseRestCost: 16,
   endgameTarget: 8,
@@ -195,6 +199,15 @@ export const DEFAULT_PARAMS: Params = {
 // compares strategy alone.
 export const PROFILES: Readonly<Record<string, Params>> = {
   current: DEFAULT_PARAMS,
+  // A cheaper coin while rebuilding after a word: tied with current in a
+  // 6-vs-6 live head-to-head (2.83rd vs 3.0th).
+  rebuild: { ...DEFAULT_PARAMS, rebuildPointsPerCoin: 0.3 },
+  // Commit 767b6fc, before buying more late became the default: endgame
+  // spending from 8 auctions left and the cap shrinking over the last 15.
+  // Buying more late (as the top bots do: Nijello wins 3.7 tiles in the
+  // last 12 auctions, against coconut's 1.9) scored +6 a game over 50
+  // simulated games and +4 over 6 live head-to-head games.
+  v767b6fc: { ...DEFAULT_PARAMS, chaseWindow: 8, lateSpecWindow: 15 },
   classic: {
     ...DEFAULT_PARAMS,
     tilePaceBoost: 0,
@@ -237,7 +250,27 @@ function pace(view: MatchView, params: Params): number {
 }
 
 function pointsPerCoin(view: MatchView, params: Params): number {
-  return params.pointsPerCoin / pace(view, params);
+  const ppc = params.pointsPerCoin / pace(view, params);
+  // Rebuilding from a short rack, coins can only become points by buying
+  // its tiles, and are worth nothing left over. Priced by pacing alone, a
+  // middling balance made every rebuild look like a loss: with 58 coins
+  // and 43 left, 7 tiles at market came to ~48 points for a ~36-point
+  // word, so the bot bid ~0 for 29 auctions.
+  if (params.rebuildPointsPerCoin > 0 && rebuilding(view, params)) {
+    return Math.min(ppc, params.rebuildPointsPerCoin);
+  }
+  return ppc;
+}
+
+// Whether the outlook plans to rebuild a long word from a short rack: the
+// rack is further from `buildTo` than the usual buys reach, and there are
+// auctions enough to win the tiles.
+function rebuilding(view: MatchView, params: Params): boolean {
+  const horizon = Math.min(params.horizon, view.auctionsLeft);
+  const buys = Math.min(params.maxBuys, Math.round(horizon * params.winRate));
+  const toBuild = params.buildTo - total(view.rack);
+  const canWin = Math.round(view.auctionsLeft * params.winRate) + 1;
+  return toBuild > buys && toBuild <= canWin;
 }
 
 // What a word's reward is worth now, per point: more early in the match,
@@ -277,9 +310,8 @@ export function outlookFor(
   // auctions left, planning 7 buys crowded the reachable short words out
   // of the search, so every tile looked worthless and a leading bot sat on
   // 52 coins while it was passed (match 1077).
-  const toBuild = params.buildTo - total(view.rack);
-  const canWin = Math.round(view.auctionsLeft * params.winRate) + 1;
-  if (toBuild > buys && toBuild <= canWin) {
+  if (rebuilding(view, params)) {
+    const toBuild = params.buildTo - total(view.rack);
     horizon = Math.min(
       view.auctionsLeft,
       Math.max(horizon, Math.ceil(toBuild / params.winRate)),

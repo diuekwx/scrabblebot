@@ -100,7 +100,9 @@ interface CandidateSet {
 // The search over the whole lexicon is the slow part, and racks change less
 // often than pools, so keep the last few results per lexicon.
 const candidateCaches = new WeakMap<Lexicon, Map<string, CandidateSet>>();
-const CANDIDATE_CACHE_SIZE = 12;
+// Room for the endgame's racks too (each rack, each rack less a word, at a
+// couple of search depths) without evicting ones still in use.
+const CANDIDATE_CACHE_SIZE = 24;
 
 // Words the rack is at most `maxNeed` tiles short of, best reward first.
 function candidates(
@@ -387,12 +389,26 @@ export function without(rack: Counts, word: Word): Counts {
 // Play greedily: best reward first, until nothing spells. For the end of a
 // match, when every tile left on the rack is worth nothing.
 export function dump(lex: Lexicon, rack: Counts): Word[] {
+  // The endgame asks this several times an auction for the same rack, and
+  // each step searches the lexicon for a rack it hasn't seen: with 8-9
+  // tiles that froze the bot for up to a second at a time.
+  let cache = dumpCaches.get(lex);
+  if (!cache) dumpCaches.set(lex, (cache = new Map()));
+  const key = rack.join(",");
+  const hit = cache.get(key);
+  if (hit) return hit.slice();
   const out: Word[] = [];
   let r = rack;
   for (;;) {
     const w = playable(lex, r)[0];
-    if (!w) return out;
+    if (!w) break;
     out.push(w);
     r = without(r, w);
   }
+  cache.set(key, out);
+  if (cache.size > DUMP_CACHE_SIZE) cache.delete(cache.keys().next().value!);
+  return out.slice();
 }
+
+const dumpCaches = new WeakMap<Lexicon, Map<string, Word[]>>();
+const DUMP_CACHE_SIZE = 64;

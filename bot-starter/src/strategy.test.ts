@@ -21,6 +21,7 @@ import {
   MARKET_PRICES,
   outlookFor,
   PRICE_PHASE,
+  PROFILES,
   type MatchView,
 } from "./strategy.js";
 
@@ -232,11 +233,14 @@ test("late, a short rack values the short words it can still make", () => {
 });
 
 test("late in a match, speculation is worth less than its price", () => {
-  // 5 auctions left, only an S: a Z gets a third of its market price.
-  const v = view("S", 5, 50);
+  // 2 auctions left, only an S: the cap on a Z has shrunk to the share of
+  // `lateSpecWindow` left.
+  const left = 2;
+  const v = view("S", left, 50);
   const z = bidFor(v, "Z", outlookFor(fullLexicon, v));
-  const market = MARKET_PRICES[letterIndex("Z")]! * PRICE_PHASE[5]!;
-  assert.ok(z <= Math.round(market / 3), `bid ${z} on Z, market ${market}`);
+  const market = Math.round(MARKET_PRICES[letterIndex("Z")]! * PRICE_PHASE[left]!);
+  const cap = Math.round(market * Math.min(1, left / DEFAULT_PARAMS.lateSpecWindow));
+  assert.ok(cap < market && z <= cap, `bid ${z} on Z, cap ${cap}, market ${market}`);
 });
 
 test("chase bids reach the going price but keep coins for the rest", () => {
@@ -263,6 +267,23 @@ test("down by more than common letters can make, coins still go to a scoring wor
   const look = outlookFor(fullLexicon, v);
   const bids = "AEIORNST".split("").map((l) => bidFor(v, l, look));
   assert.ok(bids.filter((b) => b >= 10).length >= 4, `bids ${bids}`);
+});
+
+test("rebuilding with a middling balance, the rebuild profile still bids", () => {
+  // Match 1761: empty rack, 58 coins, 43 left. Current pricing makes every
+  // rebuild look like a loss; the rebuild profile bids near market.
+  const v = view("", 43, 58);
+  const current = PROFILES.current!;
+  const rebuild = PROFILES.rebuild!;
+  const before = "AEIRST".split("").map((l) => bidFor(v, l, outlookFor(fullLexicon, v, current), current));
+  const after = "AEIRST".split("").map((l) => bidFor(v, l, outlookFor(fullLexicon, v, rebuild), rebuild));
+  assert.ok(after.filter((b) => b >= 8).length >= 4, `rebuild bids ${after}`);
+  assert.ok(after.reduce((a, b) => a + b) > before.reduce((a, b) => a + b));
+  // A full rack isn't rebuilding: same bids either way.
+  const full = view("AEIRST", 43, 58);
+  const look = outlookFor(fullLexicon, full, current, () => 0.5);
+  const look2 = outlookFor(fullLexicon, full, rebuild, () => 0.5);
+  assert.equal(bidFor(full, "N", look, current), bidFor(full, "N", look2, rebuild));
 });
 
 test("no chase bids when the rack already spells enough", () => {
