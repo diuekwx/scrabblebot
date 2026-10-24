@@ -19,6 +19,8 @@
 // itself can register, so this has to come from the bot's process.
 // `NO_LOBBY=1` keeps it out of lobby matches, so it plays only the
 // tournament. `MAX_MATCHES=<n>` makes it exit after n matches.
+// `FULL_SYNC=1` subscribes to every table, as the starter did, instead of
+// only the bot's own matches.
 //
 // The bidding and word-play policy is in ./strategy.ts.
 
@@ -26,6 +28,11 @@ import {
   DbConnection,
   type ErrorContext,
 } from "./module_bindings/index.js";
+import type {
+  AuctionResult,
+  MatchParticipant,
+  WordPlay,
+} from "./module_bindings/types.js";
 import { Identity } from "spacetimedb";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -41,7 +48,9 @@ import {
 } from "./engine.js";
 import {
   bidFor,
+  chaseGap,
   choosePlays,
+  endgameGoal,
   DEFAULT_PARAMS,
   outlookFor,
   type MatchView,
@@ -92,8 +101,90 @@ const LEXICON = buildLexicon(
 let myIdentity: Identity | null = null;
 let myBotId: bigint | null = null;
 const bidsByAuction = new Set<bigint>();
+// What the bot subscribes to. Subscribing to every table brought in every
+// match ever played (well over 100,000 rows by the afternoon, re-downloaded
+// on every reconnect) when it only ever reads its own. So it takes the small
+// tables whole, its own seats to learn of new matches, and each of its
+// matches as it starts. FULL_SYNC=1 goes back to all tables, and so does
+// the bot itself if a targeted subscription fails.
+let fullSync = process.env.FULL_SYNC === "1";
+const BASE_QUERIES = [
+  "SELECT * FROM bot_credential",
+  "SELECT * FROM bot",
+  "SELECT * FROM lobby",
+  "SELECT * FROM match_state",
+  "SELECT * FROM my_rack",
+];
+const seatQueries = (botId: bigint) => [
+  `SELECT * FROM match_participant WHERE bot_id = ${botId}`,
+  `SELECT * FROM lobby_member WHERE bot_id = ${botId}`,
+];
+const matchQueries = (matchId: bigint) => [
+  `SELECT * FROM match_participant WHERE match_id = ${matchId}`,
+  `SELECT * FROM auction WHERE match_id = ${matchId}`,
+  `SELECT * FROM auction_result WHERE match_id = ${matchId}`,
+  `SELECT * FROM word_play WHERE match_id = ${matchId}`,
+];
+
+// A targeted subscription the bot can't get leaves it blind, so drop back
+// to subscribing to everything: reconnect with `fullSync` set. (One
+// connection can't mix the two kinds.)
+function fallBack(conn: DbConnection, what: string) {
+  return (_ctx?: ErrorContext) => {
+    if (fullSync) return;
+    console.error(`[${BOT_NAME}] ${what} failed; reconnecting with all tables`);
+    fullSync = true;
+    conn.disconnect();
+  };
+}
+
 // Matches this bot has a seat in.
 const myMatches = new Set<bigint>();
+// When each was first tracked, to notice one whose auctions never arrive.
+const trackedAt = new Map<bigint, number>();
+// Those matches' rows, by match, keyed by row id, kept as they arrive.
+// Scanning whole tables instead got slower all day: the server keeps every
+// match ever played, ~73,000 auction results by mid-afternoon, and bid
+// times crept from 63 ms to 122 ms.
+type ByMatch<T> = Map<bigint, Map<bigint, T>>;
+const resultsByMatch: ByMatch<AuctionResult> = new Map();
+const wordsByMatch: ByMatch<WordPlay> = new Map();
+const seatsByMatch: ByMatch<MatchParticipant> = new Map();
+
+function keep<T>(index: ByMatch<T>, matchId: bigint, id: bigint, row: T) {
+  if (!myMatches.has(matchId)) return;
+  let rows = index.get(matchId);
+  if (!rows) index.set(matchId, (rows = new Map()));
+  rows.set(id, row);
+}
+
+const rowsOf = <T>(index: ByMatch<T>, matchId: bigint) =>
+  index.get(matchId)?.values() ?? [];
+
+// Start keeping a match's rows, with one scan for those already here.
+// Without the full subscription, first subscribe to them: they arrive as
+// inserts, and the index keeps them.
+function trackMatch(conn: DbConnection, matchId: bigint) {
+  if (myMatches.has(matchId)) return;
+  myMatches.add(matchId);
+  trackedAt.set(matchId, performance.now());
+  if (!fullSync) {
+    conn
+      .subscriptionBuilder()
+      .onApplied(() => scheduleAct(conn))
+      .onError(fallBack(conn, `subscribing to match ${matchId}`))
+      .subscribe(matchQueries(matchId));
+  }
+  for (const r of conn.db.auctionResult.iter()) {
+    if (r.matchId === matchId) keep(resultsByMatch, matchId, r.auctionId, r);
+  }
+  for (const w of conn.db.wordPlay.iter()) {
+    if (w.matchId === matchId) keep(wordsByMatch, matchId, w.id, w);
+  }
+  for (const p of conn.db.matchParticipant.iter()) {
+    if (p.matchId === matchId) keep(seatsByMatch, matchId, p.id, p);
+  }
+}
 // When each open auction of ours was first seen, to log how long bids take.
 const seenAt = new Map<bigint, number>();
 // The rack and stretch of the match each match's plays were last decided
@@ -123,8 +214,7 @@ function participantForMatch(
   matchId: bigint,
 ): { balance: number; score: number } | null {
   if (myBotId === null) return null;
-  for (const p of conn.db.matchParticipant.iter()) {
-    if (p.matchId !== matchId) continue;
+  for (const p of rowsOf(seatsByMatch, matchId)) {
     if (p.botId !== myBotId) continue;
     return { balance: Number(p.balance), score: Number(p.score) };
   }
@@ -149,15 +239,12 @@ function unseenPool(
     if (!c) m.set(bot, (c = emptyCounts()));
     for (const ch of letters) c[letterIndex(ch)]!++;
   };
-  for (const r of conn.db.auctionResult.iter()) {
-    if (r.matchId !== matchId) continue;
+  for (const r of rowsOf(resultsByMatch, matchId)) {
     pool[letterIndex(r.letter)]!--;
     if (r.winnerBotId !== undefined) add(won, r.winnerBotId, r.letter);
   }
   if (openLetter) pool[letterIndex(openLetter)]!--;
-  for (const w of conn.db.wordPlay.iter()) {
-    if (w.matchId === matchId) add(played, w.botId, w.word);
-  }
+  for (const w of rowsOf(wordsByMatch, matchId)) add(played, w.botId, w.word);
   // Tiles a bot has held beyond those it won were dealt to it at the start.
   // For this bot that's its rack plus what it played; for others, only
   // what they played.
@@ -173,6 +260,29 @@ function unseenPool(
   }
   for (let i = 0; i < 26; i++) if (pool[i]! < 0) pool[i] = 0;
   return pool;
+}
+
+// Auctions this bot has won in the match so far.
+function tilesWonIn(conn: DbConnection, matchId: bigint): number {
+  let n = 0;
+  for (const r of rowsOf(resultsByMatch, matchId)) {
+    if (r.winnerBotId === myBotId) n++;
+  }
+  return n;
+}
+
+// Everyone's score in the match so far: they're public as it runs.
+function scoresIn(
+  conn: DbConnection,
+  matchId: bigint,
+): { mine: number; others: number[] } {
+  let mine = 0;
+  const others: number[] = [];
+  for (const p of rowsOf(seatsByMatch, matchId)) {
+    if (p.botId === myBotId) mine = Number(p.score);
+    else others.push(Number(p.score));
+  }
+  return { mine, others };
 }
 
 const fmt = (c: Counts) =>
@@ -196,9 +306,24 @@ function act(conn: DbConnection) {
   for (const matchId of myMatches) {
     const m = conn.db.matchState.id.find(matchId);
     if (m?.status.tag !== "Running") continue;
+    // Blind: in a running match whose auctions never came. Better to
+    // subscribe to everything than to sit out the match.
+    const since = performance.now() - (trackedAt.get(matchId) ?? Infinity);
+    if (
+      !fullSync &&
+      m.currentAuctionId !== undefined &&
+      !conn.db.auction.id.find(m.currentAuctionId) &&
+      since > BLIND_MS
+    ) {
+      fallBack(conn, `seeing match ${matchId}'s auctions`)();
+      return;
+    }
     actInMatch(conn, matchId, m.bagTotal, m.currentAuctionId);
   }
 }
+
+// How long a tracked match may go without its current auction showing up.
+const BLIND_MS = 3000;
 
 // Warn when something blocks the event loop long enough to risk an
 // auction: nothing else runs, bids included, until it lets go.
@@ -238,6 +363,8 @@ function actInMatch(
     // Each auction draws a tile, so the bag holds one per auction to come.
     auctionsLeft: bagTotal,
     balance,
+    tilesWon: tilesWonIn(conn, matchId),
+    scores: scoresIn(conn, matchId),
   };
 
   const play = () => {
@@ -248,7 +375,8 @@ function actInMatch(
     // 570 ms at a time. The last auction always decides: everything left
     // is played then.
     const when = view.auctionsLeft === 0 ? "last" : Math.ceil(view.auctionsLeft / 4);
-    const key = `${rack.join(",")}/${when}`;
+    // In an endgame chase, an opponent scoring moves the target too.
+    const key = `${rack.join(",")}/${when}/${chaseGap(view) ?? ""}`;
     if (decidedFor.get(matchId) === key) return;
     decidedFor.set(matchId, key);
     const plays = choosePlays(LEXICON, { ...view, rack });
@@ -284,9 +412,18 @@ function actInMatch(
     const amount = bidFor(after, open.letter, look);
     const took = performance.now() - (seenAt.get(open.id) ?? performance.now());
     seenAt.delete(open.id);
+    const gap = chaseGap(after);
+    const goal = endgameGoal(after);
+    const endgame =
+      gap !== undefined
+        ? ` chasing ${gap},`
+        : goal !== undefined
+          ? ` spending (leading),`
+          : "";
     console.log(
       `[${BOT_NAME}] match ${matchId} '${open.letter}' bid ${amount}` +
-        ` (bal ${participant.balance}, left ${view.auctionsLeft}, rack ${fmt(rack)}, ${took.toFixed(0)}ms)`,
+        ` (bal ${participant.balance}, left ${view.auctionsLeft}, rack ${fmt(rack)},` +
+        `${endgame} ${took.toFixed(0)}ms)`,
     );
     if (amount > 0) {
       const sent = performance.now();
@@ -323,11 +460,15 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
   myIdentity = identity;
   saveToken(token);
   console.log(`[${BOT_NAME}] connected as ${identity.toHexString()}`);
+  // A new connection starts with no subscriptions: track matches afresh,
+  // so a running one is subscribed to again. (Rows already indexed stay.)
+  myMatches.clear();
+  trackedAt.clear();
 
-  conn
-    .subscriptionBuilder()
-    .onApplied(() => {
-      console.log(`[${BOT_NAME}] subscription applied`);
+  const onSynced = () => {
+      console.log(
+        `[${BOT_NAME}] subscription applied (${fullSync ? "all tables" : "own matches only"})`,
+      );
 
       // Resolve our bot id, possibly after claiming a nonce.
       myBotId = resolveMyBotId(conn);
@@ -366,8 +507,16 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
         `[${BOT_NAME}] acting as bot '${bot?.name ?? "?"}' (id ${myBotId})`,
       );
       bootstrapActivity(conn);
-    })
-    .subscribeToAllTables();
+  };
+  if (fullSync) {
+    conn.subscriptionBuilder().onApplied(onSynced).subscribeToAllTables();
+  } else {
+    conn
+      .subscriptionBuilder()
+      .onApplied(onSynced)
+      .onError(fallBack(conn, "the base subscription"))
+      .subscribe(BASE_QUERIES);
+  }
 
   // Only this bot's matches need a decision. Every match on the server
   // sends updates, and deciding on each of them kept the bot busy enough
@@ -384,15 +533,21 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
   conn.db.myRack.onUpdate(() => scheduleAct(conn));
   conn.db.myRack.onDelete(() => scheduleAct(conn));
   conn.db.matchParticipant.onInsert((_ctx, p) => {
+    keep(seatsByMatch, p.matchId, p.id, p);
     if (myBotId !== null && p.botId === myBotId) {
-      myMatches.add(p.matchId);
+      trackMatch(conn, p.matchId);
       scheduleAct(conn);
     }
   });
+  conn.db.matchParticipant.onUpdate((_ctx, _old, p) =>
+    keep(seatsByMatch, p.matchId, p.id, p),
+  );
+  conn.db.wordPlay.onInsert((_ctx, w) => keep(wordsByMatch, w.matchId, w.id, w));
   conn.db.botCredential.onInsert(() => {
     if (myBotId === null) myBotId = resolveMyBotId(conn);
   });
   conn.db.auctionResult.onInsert((ctx, r) => {
+    keep(resultsByMatch, r.matchId, r.auctionId, r);
     // The initial sync replays every past auction; only report new ones.
     if (ctx.event.tag === "SubscribeApplied") return;
     if (myBotId === null || r.winnerBotId !== myBotId) return;
@@ -449,8 +604,23 @@ function joinLobby(conn: DbConnection) {
 }
 
 function bootstrapActivity(conn: DbConnection) {
+  if (fullSync) return startActivity(conn);
+  // Its own seats first: they show which matches it's in, and new seats
+  // are how it learns a match has started.
+  conn
+    .subscriptionBuilder()
+    .onApplied(() => startActivity(conn))
+    .onError(fallBack(conn, "subscribing to its seats"))
+    .subscribe(seatQueries(myBotId!));
+}
+
+function startActivity(conn: DbConnection) {
   for (const p of conn.db.matchParticipant.iter()) {
-    if (p.botId === myBotId) myMatches.add(p.matchId);
+    // Only a running match needs its rows: ended ones are done with.
+    if (p.botId !== myBotId) continue;
+    if (conn.db.matchState.id.find(p.matchId)?.status.tag === "Running") {
+      trackMatch(conn, p.matchId);
+    }
   }
   if (TOURNAMENT_ID) {
     conn.reducers

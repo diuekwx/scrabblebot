@@ -153,6 +153,7 @@ export function simulateMatch(
       pool,
       auctionsLeft: auctions - index - 1,
       balance,
+      tilesWon: won,
     };
     for (const w of choosePlays(lex, view, params, think)) {
       rack = without(rack, w);

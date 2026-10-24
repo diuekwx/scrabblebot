@@ -10,6 +10,7 @@
 // words are held back until late in the match.
 
 import {
+  closingNeeds,
   dump,
   letterIndex,
   outlook,
@@ -46,6 +47,19 @@ export interface Params {
   // speculation: bid at most this many times its market price at this
   // point in the match (0: no cap).
   speculativeCap: number;
+  // Over the last `lateSpecWindow` auctions the cap shrinks in proportion
+  // to the auctions left: with no time to build around it, a Z is worth
+  // little whatever it sells for. (With 5 left and only an S, the bot bid
+  // 50 on a Z, paid 30, and never used it.)
+  lateSpecWindow: number;
+  // Winners take about `tilePace` tiles a match. Between `boostFrom` and
+  // `boostTo` auctions left, when tiles are cheapest, a bot behind that
+  // pace bids `tilePaceBoost` more (0.3 = 30% more) on letters it values:
+  // at its usual bids it lost most mid-match tiles by a few coins.
+  tilePace: number;
+  tilePaceBoost: number;
+  boostFrom: number;
+  boostTo: number;
   samples: number;
   // Points a coin is worth, before pacing.
   pointsPerCoin: number;
@@ -72,7 +86,7 @@ export interface Params {
   // fraction that shrinks to 0 as the match ends.
   shortWordWindow: number;
   holdMargin: number;
-  // With fewer coins than `cashInBalance` the bot can't buy its way to a
+  // With `cashInBalance` coins or fewer the bot can't buy its way to a
   // longer word, so it plays its best word worth `cashInReward` or more
   // whenever it has one, and spends the reward on more tiles.
   cashInBalance: number;
@@ -80,6 +94,22 @@ export interface Params {
   // Samples for deciding whether to play a short word, which takes several
   // outlooks: fewer than for bids, since nothing waits on the answer.
   playSamples: number;
+  // Endgame chase: in the last `chaseWindow` auctions, points that tie or
+  // pass the next bot up are worth a whole place, far more than they are as
+  // points. (Match 1014 ended 9 behind 1st with 37 coins; TIME, +9, was
+  // there to buy.) A tile that leaves a gap-closing word 0, 1 or 2 tiles
+  // away gets a bid of up to that share of the balance, in `chaseShares`,
+  // and a playable gap-closer is played at once.
+  chaseWindow: number;
+  chaseShares: readonly number[];
+  // Coins a chase keeps back for each tile its word still needs after this
+  // one: about a late-match common letter.
+  chaseRestCost: number;
+  // With no one to catch, or no way to catch them, coins left are still
+  // worth nothing at the end: chase any word worth this much. (Leading in
+  // match 1077, the bot sat on 52 coins for its last 8 auctions and was
+  // passed.)
+  endgameTarget: number;
 }
 
 // Median price to beat per letter (the best bid of the other five bots)
@@ -102,6 +132,12 @@ export const PRICE_PHASE: readonly number[] = [
   0.95, 0.95, 0.93, 0.93, 0.93, 0.93, 0.93, 0.93, 0.94, 0.96, 1, 1, 1, 1, 1, 1,
   1.06, 1.07, 1.08, 1.09, 1.11, 1.14, 1.15, 1.15, 1.17, 1.17, 1.18, 1.17,
 ];
+
+// The phase multiplier for an auction with `left` auctions after it.
+function phaseAt(left: number, params: Params): number {
+  const k = Math.min(left, params.phase.length - 1);
+  return 1 + params.phaseStrength * (params.phase[k]! - 1);
+}
 
 // The average phase multiplier over the auctions a purchase could come from.
 function phaseOver(
@@ -126,6 +162,11 @@ export const DEFAULT_PARAMS: Params = {
   buildTo: 7,
   reinvest: 0,
   speculativeCap: 1,
+  lateSpecWindow: 15,
+  tilePace: 15,
+  tilePaceBoost: 0.3,
+  boostFrom: 49,
+  boostTo: 12,
   samples: 80,
   pointsPerCoin: 0.5,
   prices: MARKET_PRICES,
@@ -141,7 +182,35 @@ export const DEFAULT_PARAMS: Params = {
   cashInBalance: 25,
   cashInReward: 15,
   playSamples: 30,
+  chaseWindow: 8,
+  chaseShares: [1, 0.6, 0.35],
+  chaseRestCost: 16,
+  endgameTarget: 8,
 };
+
+// Points needed to tie the next bot up, in the last few auctions, or
+// undefined when there's no one to catch or it's too early to chase. Ties
+// share the better place.
+export function chaseGap(
+  view: MatchView,
+  params: Params = DEFAULT_PARAMS,
+): number | undefined {
+  if (!view.scores || view.auctionsLeft > params.chaseWindow) return undefined;
+  const { mine, others } = view.scores;
+  let next = Infinity;
+  for (const s of others) if (s > mine && s < next) next = s;
+  return next === Infinity ? undefined : next - mine;
+}
+
+// The points the endgame goes after: the gap to the next bot up, or, with
+// no one above, `endgameTarget`. Undefined outside the endgame.
+export function endgameGoal(
+  view: MatchView,
+  params: Params = DEFAULT_PARAMS,
+): number | undefined {
+  if (!view.scores || view.auctionsLeft > params.chaseWindow) return undefined;
+  return chaseGap(view, params) ?? params.endgameTarget;
+}
 
 // Coins are worth less the more the bot has per auction left to spend them.
 function pace(view: MatchView, params: Params): number {
@@ -170,6 +239,10 @@ export interface MatchView {
   // Auctions still to come after the open one (0: the open one is last).
   auctionsLeft: number;
   balance: number;
+  // Tiles won at auction so far this match.
+  tilesWon?: number;
+  // Live scores, when known: this bot's and its opponents'.
+  scores?: { mine: number; others: readonly number[] };
 }
 
 export function outlookFor(
@@ -185,8 +258,13 @@ export function outlookFor(
   // its first word the bot once bid 0 for 14 auctions holding 118 coins.
   // Plan instead to rebuild a long word, over as many auctions as winning
   // its tiles should take.
+  // Only while there's time to win that many tiles, though: with 8
+  // auctions left, planning 7 buys crowded the reachable short words out
+  // of the search, so every tile looked worthless and a leading bot sat on
+  // 52 coins while it was passed (match 1077).
   const toBuild = params.buildTo - total(view.rack);
-  if (toBuild > buys) {
+  const canWin = Math.round(view.auctionsLeft * params.winRate) + 1;
+  if (toBuild > buys && toBuild <= canWin) {
     horizon = Math.min(
       view.auctionsLeft,
       Math.max(horizon, Math.ceil(toBuild / params.winRate)),
@@ -218,10 +296,38 @@ export function outlookFor(
     },
     rng,
   );
+  // A tile won now can be played in any later auction, so a gap-closing
+  // word can take this tile plus one from each auction but the last. If
+  // the rack already spells enough, playing it closes the gap and there's
+  // nothing to chase. (Late in a match the bid goes out before the play.)
+  const goal = endgameGoal(view, params);
+  const closedAlready =
+    goal !== undefined &&
+    dump(lex, view.rack).reduce((s, w) => s + w.reward, 0) >= goal;
+  const maxNeed = Math.min(params.chaseShares.length, view.auctionsLeft);
+  let chaseNeeds =
+    goal === undefined || closedAlready
+      ? undefined
+      : closingNeeds(lex, view.rack, view.pool, goal, maxNeed);
+  // A gap no word can close still leaves coins to turn into points.
+  if (
+    chaseNeeds &&
+    goal! > params.endgameTarget &&
+    chaseNeeds.every((n) => n >= params.chaseShares.length)
+  ) {
+    chaseNeeds = closingNeeds(
+      lex,
+      view.rack,
+      view.pool,
+      params.endgameTarget,
+      maxNeed,
+    );
+  }
   return {
     hold: look.hold * boost,
     letterValue: look.letterValue.map((v) => v * boost),
     completes: look.completes,
+    chaseNeeds,
   };
 }
 
@@ -238,16 +344,51 @@ export function bidFor(
   const l = letterIndex(letter);
   const value = look.letterValue[l] ?? 0;
   let bid = Math.round(value / pointsPerCoin(view, params));
+  // Behind a winner's pace for tiles in the cheap middle of the match:
+  // bid harder on what it wants. (The cap below still holds speculation to
+  // market price.)
+  const left = view.auctionsLeft;
+  if (
+    params.tilePaceBoost > 0 &&
+    view.tilesWon !== undefined &&
+    value > 0 &&
+    left <= params.boostFrom &&
+    left >= params.boostTo
+  ) {
+    const matchLength = params.phase.length;
+    const elapsed = matchLength - 1 - left;
+    if (view.tilesWon < (params.tilePace * elapsed) / matchLength) {
+      // Not into cash-in range, though: spending down to there made the
+      // bot cash in 4-5 letter words mid-match, over and over, instead of
+      // building 7-letter ones (3 of 10 words long, against 18 of 26).
+      const spare = view.balance - params.cashInBalance;
+      const boosted = Math.round(bid * (1 + params.tilePaceBoost));
+      bid = Math.max(bid, Math.min(boosted, spare));
+    }
+  }
   // A tile that only might fit a word later is worth no more than what it
   // usually costs: bidding past that bought high letters that never got
   // played, leaving too few coins for the letters the rack needed.
+  const market = Math.round(params.prices[l]! * phaseAt(left, params));
   if (params.speculativeCap > 0) {
     if (!look.completes[l]) {
-      const k = Math.min(view.auctionsLeft, params.phase.length - 1);
-      const phase = 1 + params.phaseStrength * (params.phase[k]! - 1);
-      const cap = params.speculativeCap * params.prices[l]! * phase;
+      const late = Math.min(1, left / params.lateSpecWindow);
+      const cap = params.speculativeCap * market * late;
       bid = Math.min(bid, Math.round(cap));
     }
+  }
+  // Endgame chase, after the cap: a tile that brings a place-gaining word
+  // within reach is worth more than its price, and coins left at the end
+  // are worth nothing. The rest of the word must still come from auctions
+  // before the last one.
+  // At least the tile's going price, or the bid just loses: a share of a
+  // late balance (often 20-40 coins) came to 7-18 against tiles clearing
+  // at 12-20. But keep enough for the word's other tiles.
+  const rest = look.chaseNeeds?.[l];
+  if (rest !== undefined && rest < params.chaseShares.length && rest <= left - 1) {
+    const share = Math.floor(view.balance * params.chaseShares[rest]!);
+    const forRest = view.balance - rest * params.chaseRestCost;
+    bid = Math.max(bid, Math.min(Math.max(share, market), forRest));
   }
   // Pacing makes coins look cheap whenever the bot is flush, but the
   // letter is only worth `value` if the bot can still buy the rest of the
@@ -276,11 +417,13 @@ export function choosePlays(
   if (view.auctionsLeft <= 0) return dump(lex, view.rack);
   const plays: Word[] = [];
   let rack = view.rack;
+  let scores = view.scores;
   for (let n = 0; n < 4; n++) {
-    const word = choosePlay(lex, { ...view, rack }, params, rng);
+    const word = choosePlay(lex, { ...view, rack, scores }, params, rng);
     if (!word) break;
     plays.push(word);
     rack = without(rack, word);
+    if (scores) scores = { ...scores, mine: scores.mine + word.reward };
   }
   return plays;
 }
@@ -314,13 +457,26 @@ function choosePlay(
     return best;
   }
 
+  // Endgame chase: if what the rack spells now ties or passes the next bot
+  // up, play it rather than hold out for more and risk the match ending.
+  // (Leading, there's no place to lock in, so the usual rules decide: they
+  // won't trade QUARTE's shot at QUARTET for QUART.)
+  const gap = chaseGap(view, params);
+  if (gap !== undefined) {
+    const now = dump(lex, view.rack);
+    if (now.reduce((s, w) => s + w.reward, 0) >= gap) return now[0];
+  }
+
   // Broke, the bot can't buy the tiles a longer word needs, so holding out
   // for one just freezes it: in 15 of 22 live cases its last word had been
   // spellable for up to 45 auctions, and it was played when its reward
   // could no longer buy anything. Cash in, unless one tile it can still
   // afford would finish a 7-letter word.
   const cashIn = words[0]!;
-  if (view.balance < params.cashInBalance && cashIn.reward >= params.cashInReward) {
+  // At or below: the boost stops at exactly `cashInBalance`, so with `<`
+  // a bot sitting on that balance neither bid harder nor cashed in (it
+  // held FLEYS for 27 auctions on exactly 25 coins).
+  if (view.balance <= params.cashInBalance && cashIn.reward >= params.cashInReward) {
     const oneShort =
       total(view.rack) >= 6 &&
       outlookFor(lex, view, { ...params, samples: 1 }, rng).completes.some(

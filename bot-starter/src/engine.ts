@@ -191,6 +191,9 @@ export interface Outlook {
   letterValue: Float64Array;
   // 1 for each letter that, added to the rack, spells a 7+ letter word.
   completes: Uint8Array;
+  // In an endgame chase, for each letter, how many more tiles a word that
+  // closes the gap would still need after winning it (see `closingNeeds`).
+  chaseNeeds?: Uint8Array;
 }
 
 export interface OutlookParams {
@@ -335,6 +338,43 @@ export function outlook(
   }
   for (let l = 0; l < 26; l++) letterValue[l]! /= samples;
   return { hold: holdSum / samples, letterValue, completes };
+}
+
+// No word worth enough is reachable with a letter: see `closingNeeds`.
+export const UNREACHABLE = 255;
+
+// For each letter: how many more tiles, after winning one of it, the rack
+// would still need to spell a word worth at least `minReward`, buying at
+// most `maxNeed` tiles in all, each still unseen in `pool`. UNREACHABLE if
+// no such word uses the letter. One search, not one per letter.
+export function closingNeeds(
+  lex: Lexicon,
+  rack: Counts,
+  pool: Counts,
+  minReward: number,
+  maxNeed: number,
+): Uint8Array {
+  const needs = new Uint8Array(26).fill(UNREACHABLE);
+  const set = candidates(lex, rack, maxNeed);
+  const { pairStart, pairLetter, pairCount } = set;
+  for (let c = 0; c < set.n; c++) {
+    if (set.size[c] === 0) continue; // spellable already: nothing to buy
+    if (lex.words[set.word[c]!]!.reward < minReward) continue;
+    const from = pairStart[c]!;
+    const to = pairStart[c + 1]!;
+    // Winning one `l` leaves the rest to come from the unseen tiles.
+    for (let i = from; i < to; i++) {
+      const l = pairLetter[i]!;
+      let ok = true;
+      for (let j = from; j < to && ok; j++) {
+        const want = pairCount[j]! - (j === i ? 1 : 0);
+        if (want > pool[pairLetter[j]!]!) ok = false;
+      }
+      const rest = set.size[c]! - 1;
+      if (ok && rest < needs[l]!) needs[l] = rest;
+    }
+  }
+  return needs;
 }
 
 // Remove a word's tiles from a copy of the rack.
