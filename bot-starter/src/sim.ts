@@ -3,6 +3,10 @@
 //   npm run sim -- [matches] [param=value ...]
 //   e.g. npm run sim -- 100 pointsPerCoin=0.5 maxBuys=4
 //
+// PROFILE=<name> starts from a profile in ./strategy.ts instead of the
+// default. FIRST_PRICE=1 makes the winner pay its own bid; the market's
+// bids stay as they were under Vickrey payment.
+//
 // It plays the module's rules for one bot: a 98-tile bag, 5 tiles dealt to
 // each of 6 seats, one auction per remaining tile, Vickrey payment, and the
 // match ending as the last auction closes. The other five seats are a
@@ -29,6 +33,7 @@ import {
   choosePlays,
   DEFAULT_PARAMS,
   outlookFor,
+  PROFILES,
   type MatchView,
   type Params,
 } from "./strategy.js";
@@ -114,6 +119,7 @@ export function simulateMatch(
   market: Market,
   params: Params,
   seed: number,
+  firstPrice = false,
 ): MatchResult {
   // Tiles and prices from one stream, the strategy's sampling from another,
   // so a change of params doesn't change the match it plays.
@@ -154,6 +160,7 @@ export function simulateMatch(
       auctionsLeft: auctions - index - 1,
       balance,
       tilesWon: won,
+      firstPrice,
     };
     for (const w of choosePlays(lex, view, params, think)) {
       rack = without(rack, w);
@@ -166,7 +173,7 @@ export function simulateMatch(
     const bid = bidFor(after, letter, look, params);
     const price = priceToBeat(market, letter, index, world);
     if (bid > price || (bid === price && bid > 0 && world() < 0.5)) {
-      const paid = price > 0 ? price : Math.min(RESERVE, bid);
+      const paid = firstPrice ? bid : price > 0 ? price : Math.min(RESERVE, bid);
       balance -= paid;
       spent += paid;
       won++;
@@ -193,7 +200,8 @@ export function parseParams(args: string[], base: Params = DEFAULT_PARAMS): Para
     if (!key || value === undefined || !(key in params) || isTable) {
       throw new Error(`unknown param '${arg}'`);
     }
-    (params as unknown as Record<string, number>)[key] = Number(value);
+    (params as unknown as Record<string, number | boolean>)[key] =
+      typeof params[key as keyof Params] === "boolean" ? value === "true" : Number(value);
   }
   return params;
 }
@@ -201,7 +209,11 @@ export function parseParams(args: string[], base: Params = DEFAULT_PARAMS): Para
 function main() {
   const [first, ...rest] = process.argv.slice(2);
   const matches = first && !first.includes("=") ? Number(first) : 50;
-  const params = parseParams(first?.includes("=") ? [first, ...rest] : rest);
+  const profile = process.env.PROFILE ?? "current";
+  const base = PROFILES[profile];
+  if (!base) throw new Error(`unknown PROFILE '${profile}'`);
+  const firstPrice = process.env.FIRST_PRICE === "1";
+  const params = parseParams(first?.includes("=") ? [first, ...rest] : rest, base);
   const lex = buildLexicon(
     fs
       .readFileSync(path.join(here, "..", "..", "spacetimedb", "wordlist.txt"), "utf8")
@@ -211,7 +223,7 @@ function main() {
   const results: MatchResult[] = [];
   const start = performance.now();
   for (let i = 0; i < matches; i++) {
-    results.push(simulateMatch(lex, market, params, 1000 + i));
+    results.push(simulateMatch(lex, market, params, 1000 + i, firstPrice));
   }
   const mean = (f: (r: MatchResult) => number) =>
     results.reduce((s, r) => s + f(r), 0) / results.length;
@@ -224,6 +236,8 @@ function main() {
   console.log(
     JSON.stringify({
       matches,
+      profile,
+      firstPrice,
       score: Number(mean((r) => r.score).toFixed(1)),
       firsts: Number(mean((r) => (r.place === 1 ? 1 : 0)).toFixed(2)),
       place: Number(mean((r) => r.place).toFixed(2)),

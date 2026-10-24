@@ -286,6 +286,37 @@ test("rebuilding with a middling balance, the rebuild profile still bids", () =>
   assert.equal(bidFor(full, "N", look, current), bidFor(full, "N", look2, rebuild));
 });
 
+test("the focus profile bids near-market wanted letters up to market + 1", () => {
+  const focus = PROFILES.focus!;
+  const current = PROFILES.current!;
+  const v = view("AEINR", 30, 90);
+  const look = outlookFor(fullLexicon, v, current, () => 0.4);
+  for (const letter of "ABCDEFGHIJKLMNOPQRSTUVWXYZ") {
+    const l = letterIndex(letter);
+    const before = bidFor(v, letter, look, current);
+    const after = bidFor(v, letter, look, focus);
+    const market = Math.round(MARKET_PRICES[l]! * PRICE_PHASE[30]!);
+    if (look.letterValue[l]! > 0 && before >= 0.6 * market && before < market) {
+      assert.ok(after >= market, `${letter}: ${before} -> ${after}, market ${market}`);
+    } else {
+      assert.ok(after >= before, `${letter}: ${before} -> ${after}`);
+    }
+  }
+});
+
+test("the quality profile can hold a cheap early long word", () => {
+  // TOMENTA-like racks: a 7-letter word of 1-point letters, early. The
+  // current default plays it at once; quality may hold it, and always
+  // plays a valuable one.
+  const early = view("AEMNOTT", 50, 60);
+  assert.equal(choosePlays(fullLexicon, early, PROFILES.current!)[0]?.text.length, 7);
+  const big = view("EQUARTT", 50, 60); // QUARTET, 48
+  assert.equal(choosePlays(fullLexicon, big, PROFILES.quality!)[0]?.text, "QUARTET");
+  // Late, quality plays cheap long words like the default.
+  const late = view("AEMNOTT", 20, 60);
+  assert.equal(choosePlays(fullLexicon, late, PROFILES.quality!)[0]?.text.length, 7);
+});
+
 test("no chase bids when the rack already spells enough", () => {
   // EEFLSY spells FLEYS (+22): playing it closes a 9-point gap.
   const scores = { mine: 87, others: [96] };
@@ -352,4 +383,57 @@ test("an outlook takes well under an auction", () => {
     const ms = performance.now() - start;
     assert.ok(ms < 250, `outlook for ${rack} took ${ms.toFixed(0)} ms`);
   }
+});
+
+test("in a first-price auction, the tourney profile bids near market", () => {
+  const tourney = PROFILES.tourney!;
+  // AEINRT + H spells ANTHER, HAIRNET and more: worth far more than H's
+  // price.
+  const v = view("AEINRT", 30, 100);
+  const fp = { ...v, firstPrice: true };
+  const look = outlookFor(fullLexicon, v, tourney);
+  const full = bidFor(v, "H", look, tourney);
+  const shaded = bidFor(fp, "H", look, tourney);
+  const market = Math.round(MARKET_PRICES[letterIndex("H")]! * PRICE_PHASE[30]!);
+  assert.ok(full > market, `second-price bid ${full}`);
+  assert.equal(
+    shaded,
+    Math.round(market + (full - market) * tourney.firstPriceExcess),
+  );
+  // A letter worth no more than market is shaded under the bid.
+  for (const letter of "ABEOU") {
+    const b = bidFor(v, letter, look, tourney);
+    const m = Math.round(MARKET_PRICES[letterIndex(letter)]! * PRICE_PHASE[30]!);
+    if (b > 0 && b <= m) {
+      assert.equal(bidFor(fp, letter, look, tourney), Math.round(b * tourney.firstPriceShade));
+    }
+  }
+  // The current profile doesn't look at the auction type.
+  const cur = outlookFor(fullLexicon, v);
+  assert.equal(bidFor(fp, "H", cur), bidFor(v, "H", cur));
+});
+
+test("in elimination, the chase is only to get off last", () => {
+  const tourney = PROFILES.tourney!;
+  const at = (mine: number, others: number[]): MatchView => ({
+    ...view("", 4),
+    scores: { mine, others },
+    objective: "survive",
+  });
+  assert.equal(chaseGap(at(60, [96, 71, 69]), tourney), 10); // pass 69
+  assert.equal(chaseGap(at(69, [96, 71, 69]), tourney), 1); // a tie isn't safe
+  assert.equal(chaseGap(at(87, [96, 71, 69]), tourney), undefined); // not last
+  // Place-chasing would go after 96.
+  assert.equal(chaseGap(at(87, [96, 71, 69])), 9);
+});
+
+test("in the final's early games, there's no chase: only the sum counts", () => {
+  const tourney = PROFILES.tourney!;
+  const v: MatchView = {
+    ...view("", 4),
+    scores: { mine: 60, others: [70] },
+    objective: "points",
+  };
+  assert.equal(chaseGap(v, tourney), undefined);
+  assert.equal(chaseGap(v), 10);
 });

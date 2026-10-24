@@ -108,12 +108,40 @@ export interface Params {
   // Coins a chase keeps back for each tile its word still needs after this
   // one: about a late-match common letter.
   chaseRestCost: number;
+  // With more than `cheapLongLeft` auctions left, a best long word worth
+  // under `cheapLongReward` is played only if that beats holding for a
+  // better one (0: always play). Games whose first long word was under 40
+  // averaged ~4th place; over 50, ~2nd.
+  cheapLongReward: number;
+  cheapLongLeft: number;
+  // A wanted letter bid at `focusFrom` or more of its market price, but
+  // under it, is raised to market + 1 (0: off). Mid-match the bot lost a
+  // quarter of the auctions it bid on by 2 coins or less.
+  focusFrom: number;
   // With no one to catch, or no way to catch them, coins left are still
   // worth nothing at the end: chase any word worth this much. (Leading in
   // match 1077, the bot sat on 52 coins for its last 8 auctions and was
   // passed.)
   endgameTarget: number;
+  // First-price auctions (the winner pays its own bid, not the runner-up's;
+  // a tournament can be set up that way): a bid at or under the market
+  // price is shaded to `firstPriceShade` of itself, and the part of a bid
+  // above market is cut to `firstPriceExcess` of itself. Bidding the whole
+  // value pays the whole value: coconut bids ~17 a tile where it pays ~14.
+  // (0: bid as if second-price.)
+  firstPriceShade: number;
+  firstPriceExcess: number;
+  // Play the endgame for what the tournament stage scores (see
+  // `Objective`) rather than always for place.
+  stageObjectives: boolean;
 }
+
+// What a match's endgame plays for. "place": finish as high as possible
+// (lobby and Swiss matches). "survive": don't finish last (elimination
+// matches, where only last place goes out, and the last game of the final,
+// where two bots' scores over the final are compared). "points": score as
+// much as possible (earlier games of the final, which only add to a sum).
+export type Objective = "place" | "survive" | "points";
 
 // Median price to beat per letter (the best bid of the other five bots)
 // over 122 lobby matches of real bots, 330-451, leaving out the last two
@@ -190,6 +218,12 @@ export const DEFAULT_PARAMS: Params = {
   chaseShares: [1, 0.6, 0.35],
   chaseRestCost: 16,
   endgameTarget: 8,
+  cheapLongReward: 0,
+  cheapLongLeft: 30,
+  focusFrom: 0,
+  firstPriceShade: 0,
+  firstPriceExcess: 0.35,
+  stageObjectives: false,
 };
 
 // Named strategies, picked with PROFILE=<name>. "classic" is the strategy
@@ -208,6 +242,21 @@ export const PROFILES: Readonly<Record<string, Params>> = {
   // last 12 auctions, against coconut's 1.9) scored +6 a game over 50
   // simulated games and +4 over 6 live head-to-head games.
   v767b6fc: { ...DEFAULT_PARAMS, chaseWindow: 8, lateSpecWindow: 15 },
+  // On test: hold cheap early long words; bid near-market letters up.
+  quality: { ...DEFAULT_PARAMS, cheapLongReward: 36 },
+  focus: { ...DEFAULT_PARAMS, focusFrom: 0.6 },
+  qualityFocus: { ...DEFAULT_PARAMS, cheapLongReward: 36, focusFrom: 0.6 },
+  // For the tournament: current, plus shaded bids in first-price auctions
+  // and endgames played for what each stage scores. Over 60 simulated
+  // first-price games current scored 70.8 (89.9 when second-price); shading
+  // at 0.95/0.5 scored 76.0, 1/0.4 74.1, 0.9/0.35 70.9, 0.8/0.6 59.0. Over
+  // 120, 0.95/0.5 scored 74.0 (3.46th) against current's 69.7 (3.68th).
+  tourney: {
+    ...DEFAULT_PARAMS,
+    firstPriceShade: 0.95,
+    firstPriceExcess: 0.5,
+    stageObjectives: true,
+  },
   classic: {
     ...DEFAULT_PARAMS,
     tilePaceBoost: 0,
@@ -225,6 +274,17 @@ export function chaseGap(
 ): number | undefined {
   if (!view.scores || view.auctionsLeft > params.chaseWindow) return undefined;
   const { mine, others } = view.scores;
+  const objective = params.stageObjectives ? (view.objective ?? "place") : "place";
+  // Only the sum counts: a place gained in this game is worth nothing.
+  if (objective === "points") return undefined;
+  // Only last goes out: pass the lowest of the others, and above them
+  // there's no one to chase. Pass, not tie: a tie for last goes to the
+  // tournament's total score, which can go either way.
+  if (objective === "survive") {
+    if (others.length === 0) return undefined;
+    const lowest = Math.min(...others);
+    return mine <= lowest ? lowest - mine + 1 : undefined;
+  }
   let next = Infinity;
   for (const s of others) if (s > mine && s < next) next = s;
   return next === Infinity ? undefined : next - mine;
@@ -289,8 +349,13 @@ export interface MatchView {
   balance: number;
   // Tiles won at auction so far this match.
   tilesWon?: number;
-  // Live scores, when known: this bot's and its opponents'.
+  // Live scores, when known: this bot's and its opponents'. In the last
+  // game of a tournament final, they include the final's earlier games.
   scores?: { mine: number; others: readonly number[] };
+  // Whether the winner pays its own bid rather than the runner-up's.
+  firstPrice?: boolean;
+  // What the endgame plays for (default "place").
+  objective?: Objective;
 }
 
 export function outlookFor(
@@ -419,6 +484,17 @@ export function bidFor(
   // usually costs: bidding past that bought high letters that never got
   // played, leaving too few coins for the letters the rack needed.
   const market = Math.round(params.prices[l]! * phaseAt(left, params));
+  // Nearly the going price loses as surely as nothing does: if the bot
+  // wants the letter that much, bid enough to get it. (The cap below still
+  // holds letters that finish nothing to their market price.)
+  if (
+    params.focusFrom > 0 &&
+    value > 0 &&
+    bid >= params.focusFrom * market &&
+    bid < market
+  ) {
+    bid = market + 1;
+  }
   if (params.speculativeCap > 0) {
     if (!look.completes[l]) {
       const late =
@@ -439,6 +515,17 @@ export function bidFor(
     const share = Math.floor(view.balance * params.chaseShares[rest]!);
     const forRest = view.balance - rest * params.chaseRestCost;
     bid = Math.max(bid, Math.min(Math.max(share, market), forRest));
+  }
+  // First price: every coin bid is a coin paid, so a bid of the letter's
+  // whole value wins it for nothing gained. The others' best bid is about
+  // `market`, so stay near it: a little under for a letter worth no more,
+  // and only part of the way to the value for one worth more. (Chase bids
+  // too: 60% of 40 coins, paid in full, leaves nothing for the next gap.)
+  if (view.firstPrice && params.firstPriceShade > 0) {
+    bid =
+      bid <= market
+        ? Math.round(bid * params.firstPriceShade)
+        : Math.round(market + (bid - market) * params.firstPriceExcess);
   }
   // Pacing makes coins look cheap whenever the bot is flush, but the
   // letter is only worth `value` if the bot can still buy the rest of the
@@ -503,6 +590,20 @@ function choosePlay(
         best = w;
         bestValue = value;
       }
+    }
+    // Early on, a cheap one spends 7 tiles on few points: play it only if
+    // that, plus what's left, beats holding for a better word.
+    if (
+      params.cheapLongReward > 0 &&
+      view.auctionsLeft > params.cheapLongLeft &&
+      long[0]!.reward < params.cheapLongReward
+    ) {
+      const quick = { ...params, samples: params.playSamples };
+      const hold = outlookFor(lex, view, quick, rng).hold;
+      const rest = without(view.rack, best);
+      const play =
+        best.reward * boost + outlookFor(lex, { ...view, rack: rest }, quick, rng).hold;
+      if (hold > play) return undefined;
     }
     return best;
   }

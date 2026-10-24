@@ -34,6 +34,7 @@ import type {
   AuctionResult,
   Match,
   MatchParticipant,
+  TournamentMatch,
   WordPlay,
 } from "./module_bindings/types.js";
 import { Identity } from "spacetimedb";
@@ -57,6 +58,7 @@ import {
   PROFILES,
   outlookFor,
   type MatchView,
+  type Objective,
 } from "./strategy.js";
 
 const HOST = process.env.STDB_HOST ?? "https://maincloud.spacetimedb.com";
@@ -124,6 +126,7 @@ const BASE_QUERIES = [
   "SELECT * FROM lobby",
   "SELECT * FROM match_state",
   "SELECT * FROM my_rack",
+  "SELECT * FROM tournament_match",
 ];
 const seatQueries = (botId: bigint) => [
   `SELECT * FROM match_participant WHERE bot_id = ${botId}`,
@@ -289,19 +292,109 @@ function tilesWonIn(conn: DbConnection, matchId: bigint): number {
   return n;
 }
 
-// Everyone's score in the match so far: they're public as it runs.
+// Everyone's score in the match so far: they're public as it runs. With
+// `before`, plus each bot's score from earlier games.
 function scoresIn(
   conn: DbConnection,
   matchId: bigint,
+  before?: Map<bigint, number>,
 ): { mine: number; others: number[] } {
   let mine = 0;
   const others: number[] = [];
   for (const p of rowsOf(seatsByMatch, matchId)) {
-    if (p.botId === myBotId) mine = Number(p.score);
-    else others.push(Number(p.score));
+    const score = Number(p.score) + (before?.get(p.botId) ?? 0);
+    if (p.botId === myBotId) mine = score;
+    else others.push(score);
   }
   return { mine, others };
 }
+
+// Tournament matches by match id, kept as they arrive.
+const tournamentMatches = new Map<bigint, TournamentMatch>();
+// Games in a tournament final (the module's FINAL_GAMES): the finalists'
+// scores over all of them decide the winner.
+const FINAL_GAMES = 3;
+// For the last game of a final, each finalist's score in the earlier
+// games, once all of them are known.
+const finalCarry = new Map<bigint, Map<bigint, number>>();
+const carryRequested = new Set<bigint>();
+
+// The earlier games of the final that `tm` is a game of.
+function earlierFinalGames(tm: TournamentMatch): bigint[] {
+  const ids: bigint[] = [];
+  for (const other of tournamentMatches.values()) {
+    if (
+      other.tournamentId === tm.tournamentId &&
+      other.phase.tag === "Final" &&
+      other.matchId < tm.matchId
+    ) {
+      ids.push(other.matchId);
+    }
+  }
+  return ids;
+}
+
+// Each finalist's score over the final's earlier games, or undefined until
+// every one of them is known. Without the full subscription, first
+// subscribe to those games' seats; only this bot's own are there.
+function carryInto(
+  conn: DbConnection,
+  tm: TournamentMatch,
+  earlier: bigint[],
+): Map<bigint, number> | undefined {
+  const known = finalCarry.get(tm.matchId);
+  if (known) return known;
+  if (!fullSync && !carryRequested.has(tm.matchId)) {
+    carryRequested.add(tm.matchId);
+    conn
+      .subscriptionBuilder()
+      .onApplied(() => scheduleAct(conn))
+      .onError(logFailure(`subscribing to the final's earlier games`))
+      .subscribe(
+        earlier.map((id) => `SELECT * FROM match_participant WHERE match_id = ${id}`),
+      );
+  }
+  const wanted = new Set(earlier);
+  const seats = new Map<bigint, number>();
+  const sums = new Map<bigint, number>();
+  for (const p of conn.db.matchParticipant.iter()) {
+    if (!wanted.has(p.matchId)) continue;
+    seats.set(p.matchId, (seats.get(p.matchId) ?? 0) + 1);
+    sums.set(p.botId, (sums.get(p.botId) ?? 0) + Number(p.score));
+  }
+  // A final is two bots: every earlier game needs both seats.
+  if (earlier.some((id) => (seats.get(id) ?? 0) < 2)) return undefined;
+  finalCarry.set(tm.matchId, sums);
+  return sums;
+}
+
+// What this match's endgame plays for, and the earlier scores that count
+// with it. Lobby matches and Swiss rounds rank by place; elimination
+// matches knock out only last; the final is decided by the sum of its
+// games, so the earlier ones are for points and the last one is a race
+// against the other finalist's total.
+function stageOf(
+  conn: DbConnection,
+  matchId: bigint,
+): { objective: Objective; before?: Map<bigint, number> } {
+  const tm = tournamentMatches.get(matchId);
+  switch (tm?.phase.tag) {
+    case undefined:
+    case "Swiss":
+      return { objective: "place" };
+    case "Bracket":
+      return { objective: "survive" };
+    case "Final": {
+      const earlier = earlierFinalGames(tm);
+      if (earlier.length < FINAL_GAMES - 1) return { objective: "points" };
+      // Not knowing the totals, points are the safe thing to play for.
+      const before = carryInto(conn, tm, earlier);
+      return before ? { objective: "survive", before } : { objective: "points" };
+    }
+  }
+}
+// Each match's stage, as last logged.
+const stageLogged = new Set<string>();
 
 const fmt = (c: Counts) =>
   [...c].map((n, i) => String.fromCharCode(65 + i).repeat(n)).join("");
@@ -336,7 +429,13 @@ function act(conn: DbConnection) {
       fallBack(conn, `seeing match ${matchId}'s auctions`)();
       return;
     }
-    actInMatch(conn, matchId, m.bagTotal, m.currentAuctionId);
+    actInMatch(
+      conn,
+      matchId,
+      m.bagTotal,
+      m.currentAuctionId,
+      m.auctionType.tag === "FirstPrice",
+    );
   }
 }
 
@@ -362,6 +461,7 @@ function actInMatch(
   matchId: bigint,
   bagTotal: number,
   currentAuctionId: bigint | undefined,
+  firstPrice: boolean,
 ) {
   const participant = participantForMatch(conn, matchId);
   if (!participant) return;
@@ -375,6 +475,7 @@ function actInMatch(
   const open = auction;
   let rack = rackForMatch(conn, matchId);
   let balance = participant.balance;
+  const stage = stageOf(conn, matchId);
   const view: MatchView = {
     rack,
     pool: unseenPool(conn, matchId, rack, open.letter),
@@ -382,8 +483,24 @@ function actInMatch(
     auctionsLeft: bagTotal,
     balance,
     tilesWon: tilesWonIn(conn, matchId),
-    scores: scoresIn(conn, matchId),
+    scores: scoresIn(conn, matchId, stage.before),
+    firstPrice,
+    objective: stage.objective,
   };
+  const stageKey = `${matchId}/${stage.objective}/${stage.before ? "carry" : ""}`;
+  if (!stageLogged.has(stageKey)) {
+    stageLogged.add(stageKey);
+    const tm = tournamentMatches.get(matchId);
+    console.log(
+      `[${BOT_NAME}] match ${matchId}: ${firstPrice ? "first" : "second"}-price,` +
+        ` ${tm ? `tournament ${tm.tournamentId} ${tm.phase.tag} round ${tm.round}` : "lobby"},` +
+        ` playing for ${stage.objective}` +
+        (stage.before
+          ? ` (earlier games: ${[...stage.before].map(([b, s]) => `${b}:${s}`).join(" ")})`
+          : "") +
+        (PARAMS.stageObjectives ? "" : " (stage objectives off in this profile)"),
+    );
+  }
 
   const play = () => {
     if (playsInFlight.has(matchId)) return;
@@ -544,6 +661,10 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
   conn.db.auction.onInsert((_ctx, a) => auctions.set(a.id, a));
   conn.db.auction.onUpdate((_ctx, _old, a) => auctions.set(a.id, a));
   conn.db.auction.onDelete((_ctx, a) => auctions.delete(a.id));
+  conn.db.tournamentMatch.onInsert((_ctx, tm) => {
+    tournamentMatches.set(tm.matchId, tm);
+    if (myMatches.has(tm.matchId)) scheduleAct(conn);
+  });
 
   // Only this bot's matches need a decision. Every match on the server
   // sends updates, and deciding on each of them kept the bot busy enough
