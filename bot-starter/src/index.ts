@@ -20,7 +20,8 @@
 // `NO_LOBBY=1` keeps it out of lobby matches, so it plays only the
 // tournament. `MAX_MATCHES=<n>` makes it exit after n matches.
 // `FULL_SYNC=1` subscribes to every table, as the starter did, instead of
-// only the bot's own matches.
+// only the bot's own matches. `PROFILE=classic` plays an earlier strategy,
+// for head-to-head tests.
 //
 // The bidding and word-play policy is in ./strategy.ts.
 
@@ -51,7 +52,7 @@ import {
   chaseGap,
   choosePlays,
   endgameGoal,
-  DEFAULT_PARAMS,
+  PROFILES,
   outlookFor,
   type MatchView,
 } from "./strategy.js";
@@ -63,6 +64,13 @@ const BOT_TOKEN = process.env.BOT_TOKEN; // from the website, first run only
 const BOT_NONCE = process.env.BOT_NONCE; // from the CLI, first run only
 const TOURNAMENT_ID = process.env.TOURNAMENT_ID;
 const NO_LOBBY = process.env.NO_LOBBY === "1";
+// Which strategy to play: see PROFILES in ./strategy.ts.
+const PROFILE = process.env.PROFILE ?? "current";
+const PARAMS = PROFILES[PROFILE]!;
+if (!PARAMS) {
+  console.error(`unknown PROFILE '${PROFILE}': ${Object.keys(PROFILES).join(", ")}`);
+  process.exit(1);
+}
 // Stop after this many matches, e.g. for a short live test.
 const MAX_MATCHES = Number(process.env.MAX_MATCHES ?? Infinity);
 let matchesPlayed = 0;
@@ -376,10 +384,10 @@ function actInMatch(
     // is played then.
     const when = view.auctionsLeft === 0 ? "last" : Math.ceil(view.auctionsLeft / 4);
     // In an endgame chase, an opponent scoring moves the target too.
-    const key = `${rack.join(",")}/${when}/${chaseGap(view) ?? ""}`;
+    const key = `${rack.join(",")}/${when}/${chaseGap(view, PARAMS) ?? ""}`;
     if (decidedFor.get(matchId) === key) return;
     decidedFor.set(matchId, key);
-    const plays = choosePlays(LEXICON, { ...view, rack });
+    const plays = choosePlays(LEXICON, { ...view, rack }, PARAMS);
     if (plays.length === 0) return;
     playsInFlight.add(matchId);
     let pending = plays.length;
@@ -402,18 +410,18 @@ function actInMatch(
   // so play first and bid for the rack the bot will actually hold. Late on
   // it weighs short words, which takes longer, so bid first: a bid that
   // misses its auction's one second is worth nothing.
-  const playFirst = view.auctionsLeft > DEFAULT_PARAMS.shortWordWindow;
+  const playFirst = view.auctionsLeft > PARAMS.shortWordWindow;
   if (playFirst) play();
 
   if (!bidsByAuction.has(open.id)) {
     bidsByAuction.add(open.id);
     const after: MatchView = { ...view, rack, balance: participant.balance };
-    const look = outlookFor(LEXICON, after);
-    const amount = bidFor(after, open.letter, look);
+    const look = outlookFor(LEXICON, after, PARAMS);
+    const amount = bidFor(after, open.letter, look, PARAMS);
     const took = performance.now() - (seenAt.get(open.id) ?? performance.now());
     seenAt.delete(open.id);
-    const gap = chaseGap(after);
-    const goal = endgameGoal(after);
+    const gap = chaseGap(after, PARAMS);
+    const goal = endgameGoal(after, PARAMS);
     const endgame =
       gap !== undefined
         ? ` chasing ${gap},`
@@ -666,6 +674,6 @@ function connect() {
 
 console.log(
   `[${BOT_NAME}] ${LEXICON.words.length} words; params ` +
-    JSON.stringify({ ...DEFAULT_PARAMS, prices: undefined, phase: undefined }),
+    `profile ${PROFILE} ` + JSON.stringify({ ...PARAMS, prices: undefined, phase: undefined }),
 );
 connect();

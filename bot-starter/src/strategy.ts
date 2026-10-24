@@ -188,6 +188,21 @@ export const DEFAULT_PARAMS: Params = {
   endgameTarget: 8,
 };
 
+// Named strategies, picked with PROFILE=<name>. "classic" is the strategy
+// of the morning of 2026-10-24 (speculative cap, cash-in, rack building)
+// without what came after: the tile-pace boost, the endgame chase and
+// defend, and the late-shrinking cap. Same code otherwise, so a head-to-head
+// compares strategy alone.
+export const PROFILES: Readonly<Record<string, Params>> = {
+  current: DEFAULT_PARAMS,
+  classic: {
+    ...DEFAULT_PARAMS,
+    tilePaceBoost: 0,
+    chaseWindow: -1,
+    lateSpecWindow: 0,
+  },
+};
+
 // Points needed to tie the next bot up, in the last few auctions, or
 // undefined when there's no one to catch or it's too early to chase. Ties
 // share the better place.
@@ -309,19 +324,21 @@ export function outlookFor(
     goal === undefined || closedAlready
       ? undefined
       : closingNeeds(lex, view.rack, view.pool, goal, maxNeed);
-  // A gap no word can close still leaves coins to turn into points.
-  if (
-    chaseNeeds &&
-    goal! > params.endgameTarget &&
-    chaseNeeds.every((n) => n >= params.chaseShares.length)
-  ) {
-    chaseNeeds = closingNeeds(
+  // Letters that can't help close the gap still leave coins to turn into
+  // points: for each letter, the nearer of a gap-closing word and any word
+  // worth `endgameTarget`. (Falling back only when no letter at all could
+  // close the gap left common letters out whenever a Z or X could: down 14
+  // with an empty rack and 51 coins, the bot bid 0-7 for its last 8
+  // auctions.)
+  if (chaseNeeds && goal! > params.endgameTarget) {
+    const scoring = closingNeeds(
       lex,
       view.rack,
       view.pool,
       params.endgameTarget,
       maxNeed,
     );
+    chaseNeeds = chaseNeeds.map((n, l) => Math.min(n, scoring[l]!));
   }
   return {
     hold: look.hold * boost,
@@ -372,7 +389,8 @@ export function bidFor(
   const market = Math.round(params.prices[l]! * phaseAt(left, params));
   if (params.speculativeCap > 0) {
     if (!look.completes[l]) {
-      const late = Math.min(1, left / params.lateSpecWindow);
+      const late =
+        params.lateSpecWindow > 0 ? Math.min(1, left / params.lateSpecWindow) : 1;
       const cap = params.speculativeCap * market * late;
       bid = Math.min(bid, Math.round(cap));
     }

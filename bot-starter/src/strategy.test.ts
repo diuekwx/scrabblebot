@@ -256,6 +256,15 @@ test("chase bids reach the going price but keep coins for the rest", () => {
   }
 });
 
+test("down by more than common letters can make, coins still go to a scoring word", () => {
+  // Match 1495: 14 behind, empty rack, 51 coins, 8 left. Only Z/X/J words
+  // reach 14 from a few tiles; ordinary letters should still get bids.
+  const v = { ...view("", 7, 51), scores: { mine: 84, others: [98, 109] } };
+  const look = outlookFor(fullLexicon, v);
+  const bids = "AEIORNST".split("").map((l) => bidFor(v, l, look));
+  assert.ok(bids.filter((b) => b >= 10).length >= 4, `bids ${bids}`);
+});
+
 test("no chase bids when the rack already spells enough", () => {
   // EEFLSY spells FLEYS (+22): playing it closes a 9-point gap.
   const scores = { mine: 87, others: [96] };
