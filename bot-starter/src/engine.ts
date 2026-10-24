@@ -259,7 +259,17 @@ export function outlook(
     }
     net[c] = v;
     upper[c] = v + maxCost;
-    if (v + maxCost > 0) keep.push(c);
+    // A word needing more of a letter than the pool still holds can't be
+    // finished, except by the one tile up for auction now, which the pool
+    // no longer counts. Left in, such words crowded the reachable ones out
+    // of the best MAX_PRICED: with J, Q, X and Z all played, an empty rack
+    // found nothing, valued every letter at 0, and bid 0 for 11 auctions
+    // holding 131 coins (match 8277).
+    let missing = 0;
+    for (let i = pairStart[c]!; i < pairStart[c + 1]!; i++) {
+      missing += Math.max(0, pairCount[i]! - pool[pairLetter[i]!]!);
+    }
+    if (missing <= 1 && v + maxCost > 0) keep.push(c);
   }
   // Only the best MAX_PRICED are scanned. A rack rebuilding from nothing
   // can be near 100,000 words, and sorting them all with a comparator took

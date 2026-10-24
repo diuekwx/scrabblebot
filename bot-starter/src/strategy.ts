@@ -555,11 +555,13 @@ export function choosePlays(
   const plays: Word[] = [];
   let rack = view.rack;
   let scores = view.scores;
+  let balance = view.balance;
   for (let n = 0; n < 4; n++) {
-    const word = choosePlay(lex, { ...view, rack, scores }, params, rng);
+    const word = choosePlay(lex, { ...view, rack, scores, balance }, params, rng);
     if (!word) break;
     plays.push(word);
     rack = without(rack, word);
+    balance += word.reward;
     if (scores) scores = { ...scores, mine: scores.mine + word.reward };
   }
   return plays;
@@ -573,6 +575,11 @@ function choosePlay(
 ): Word | undefined {
   const words = playable(lex, view.rack);
   if (words.length === 0) return undefined;
+  // Without a coin the bot can't win a tile, so the rack can't change:
+  // holding scores no more later, and playing now returns coins to bid
+  // with. (At 0 coins with 7 auctions left it held HEIR, +10, to the last
+  // auction, in match 8310.)
+  if (view.balance <= 0) return dump(lex, view.rack)[0];
   const boost = reinvestment(view, params);
   // A 7+ letter word already earns the top multiplier: play one now. Of
   // several, take the one worth most net of the tiles it uses up, at what

@@ -437,3 +437,32 @@ test("in the final's early games, there's no chase: only the sum counts", () => 
   assert.equal(chaseGap(v, tourney), undefined);
   assert.equal(chaseGap(v), 10);
 });
+
+test("with J, Q, X and Z gone, an empty rack still values letters", () => {
+  // Match 8277, 28 auctions left: the unseen tiles after JEZAIL, AQUAVIT
+  // and BUXOMEST. The best-valued words all needed J, Q, X or Z, so the
+  // outlook found nothing and every bid was 0.
+  const v: MatchView = {
+    rack: countsOf(""),
+    pool: countsOf("AAABCDEEEEFGIIINNNNNOOOOOPRRRRRSTTTUUVW"),
+    auctionsLeft: 28,
+    balance: 131,
+  };
+  const look = outlookFor(fullLexicon, v);
+  assert.ok(look.hold > 0, `hold ${look.hold}`);
+  const bids = "AEINRST".split("").map((l) => bidFor(v, l, look));
+  assert.ok(bids.every((b) => b > 0), `bids ${bids}`);
+});
+
+test("at 0 coins, the bot plays what it can at once", () => {
+  // Match 8310: 0 coins, EHIR, 7 auctions left, 30 behind. It held HEIR
+  // to the last auction, when its 10 coins could buy nothing.
+  const v: MatchView = {
+    ...view("EHIR", 7, 0),
+    scores: { mine: 60, others: [90, 50] },
+  };
+  const plays = choosePlays(fullLexicon, v);
+  assert.equal(plays.map((w) => w.text.length).join(), "4");
+  // With coins to buy tiles, it keeps holding for a longer word.
+  assert.equal(choosePlays(fullLexicon, { ...v, balance: 40 }).length, 0);
+});
