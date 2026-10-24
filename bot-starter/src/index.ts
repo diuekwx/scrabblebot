@@ -30,7 +30,9 @@ import {
   type ErrorContext,
 } from "./module_bindings/index.js";
 import type {
+  Auction,
   AuctionResult,
+  Match,
   MatchParticipant,
   WordPlay,
 } from "./module_bindings/types.js";
@@ -145,6 +147,14 @@ function fallBack(conn: DbConnection, what: string) {
     conn.disconnect();
   };
 }
+
+// Match states and auctions by id, kept as they arrive. The SDK's `find` on
+// a unique column scans the whole table comparing every row, and
+// match_state holds every match ever played (~2,400 by the evening):
+// looking one up on each update took ~170 ms of a ~220 ms bid, and grew
+// all day.
+const matchStates = new Map<bigint, Match>();
+const auctions = new Map<bigint, Auction>();
 
 // Matches this bot has a seat in.
 const myMatches = new Set<bigint>();
@@ -312,7 +322,7 @@ function logFailure(what: string) {
 function act(conn: DbConnection) {
   if (myBotId === null) return;
   for (const matchId of myMatches) {
-    const m = conn.db.matchState.id.find(matchId);
+    const m = matchStates.get(matchId);
     if (m?.status.tag !== "Running") continue;
     // Blind: in a running match whose auctions never came. Better to
     // subscribe to everything than to sit out the match.
@@ -320,7 +330,7 @@ function act(conn: DbConnection) {
     if (
       !fullSync &&
       m.currentAuctionId !== undefined &&
-      !conn.db.auction.id.find(m.currentAuctionId) &&
+      !auctions.get(m.currentAuctionId) &&
       since > BLIND_MS
     ) {
       fallBack(conn, `seeing match ${matchId}'s auctions`)();
@@ -357,7 +367,7 @@ function actInMatch(
   if (!participant) return;
   const auction =
     currentAuctionId !== undefined
-      ? conn.db.auction.id.find(currentAuctionId)
+      ? auctions.get(currentAuctionId)
       : undefined;
   // Between auctions there's nothing to decide. (Playing as if the match
   // were over would throw away tiles that could still make long words.)
@@ -526,6 +536,15 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
       .subscribe(BASE_QUERIES);
   }
 
+  // Keep the lookup maps current; registered first, so they're up to date
+  // before any other callback reads them.
+  conn.db.matchState.onInsert((_ctx, m) => matchStates.set(m.id, m));
+  conn.db.matchState.onUpdate((_ctx, _old, m) => matchStates.set(m.id, m));
+  conn.db.matchState.onDelete((_ctx, m) => matchStates.delete(m.id));
+  conn.db.auction.onInsert((_ctx, a) => auctions.set(a.id, a));
+  conn.db.auction.onUpdate((_ctx, _old, a) => auctions.set(a.id, a));
+  conn.db.auction.onDelete((_ctx, a) => auctions.delete(a.id));
+
   // Only this bot's matches need a decision. Every match on the server
   // sends updates, and deciding on each of them kept the bot busy enough
   // to miss auctions.
@@ -594,7 +613,7 @@ function joinLobby(conn: DbConnection) {
   if (myBotId === null || NO_LOBBY) return;
   const inRunning = Array.from(conn.db.matchParticipant.iter()).some((p) => {
     if (p.botId !== myBotId) return false;
-    const m = conn.db.matchState.id.find(p.matchId);
+    const m = matchStates.get(p.matchId);
     return m?.status.tag === "Running";
   });
   if (inRunning) return;
@@ -626,7 +645,7 @@ function startActivity(conn: DbConnection) {
   for (const p of conn.db.matchParticipant.iter()) {
     // Only a running match needs its rows: ended ones are done with.
     if (p.botId !== myBotId) continue;
-    if (conn.db.matchState.id.find(p.matchId)?.status.tag === "Running") {
+    if (matchStates.get(p.matchId)?.status.tag === "Running") {
       trackMatch(conn, p.matchId);
     }
   }
