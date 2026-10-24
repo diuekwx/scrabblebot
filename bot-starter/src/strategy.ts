@@ -1,63 +1,353 @@
-// Edit this file to implement your bidding and word-forming strategy.
+// Bidding and word-play policy, on top of the valuation in ./engine.ts.
+//
+// The idea: score is total word rewards, and coins are only worth what they
+// buy. A coin is worth some points (`pointsPerCoin`), so a tile the bot
+// still has to buy costs its market price in points, and a letter is worth
+// the points it adds to the best word the rack can reach (engine `outlook`).
+// Bids turn that back into coins. Coins left at the end are wasted, so the
+// richer the bot is for the auctions left, the less a coin is worth and the
+// higher it bids. Words of 7+ letters get the top 3x multiplier, so shorter
+// words are held back until late in the match.
 
-// Standard Scrabble letter values — useful for valuation.
-export const LETTER_VALUE: Record<string, number> = {
-  A: 1, B: 3, C: 3, D: 2, E: 1, F: 4, G: 2, H: 4, I: 1, J: 8,
-  K: 5, L: 1, M: 3, N: 1, O: 1, P: 3, Q: 10, R: 1, S: 1, T: 1,
-  U: 1, V: 4, W: 4, X: 8, Y: 4, Z: 10,
+import {
+  dump,
+  letterIndex,
+  outlook,
+  playable,
+  total,
+  without,
+  type Counts,
+  type Lexicon,
+  type Outlook,
+  type Word,
+} from "./engine.js";
+
+export interface Params {
+  // Upcoming auctions the outlook looks across, at most.
+  horizon: number;
+  // Share of upcoming auctions the bot expects to win.
+  winRate: number;
+  // Most tiles the outlook assumes the bot can buy.
+  maxBuys: number;
+  // The outlook also assumes no more buys than the balance covers at this
+  // many coins a tile (0: no such limit).
+  coinsPerBuy: number;
+  // A rack shorter than this plans enough buys, over enough auctions, to
+  // reach a word this long (0: plan only `maxBuys`).
+  buildTo: number;
+  // How much more a word is worth for each share of the match still to
+  // come: its reward comes back as coins that buy more tiles, which a word
+  // finished on the last auction can't do. 0.4 makes a word at the start
+  // worth 1.4x, falling to 1x at the end. Off: at 0.4 it inflated high
+  // letters most, and in 3 live games the bot overpaid for Z, X and Y,
+  // won 6-9 tiles and placed 6th, 6th and 5th.
+  reinvest: number;
+  // A tile that doesn't let the bot play a 7+ letter word straight away is
+  // speculation: bid at most this many times its market price at this
+  // point in the match (0: no cap).
+  speculativeCap: number;
+  samples: number;
+  // Points a coin is worth, before pacing.
+  pointsPerCoin: number;
+  // What winning a tile of each letter costs, in coins, A to Z.
+  prices: readonly number[];
+  // How prices move over a match: the multiplier on `prices` for an
+  // auction with k auctions after it is `phase[k]`.
+  phase: readonly number[];
+  // How much of `phase` to apply: 0 for flat prices, 1 for all of it.
+  phaseStrength: number;
+  // Coins per remaining auction the bot expects to spend; pacing compares
+  // the balance against this.
+  spendRate: number;
+  // Bounds on the pacing multiplier.
+  paceMin: number;
+  paceMax: number;
+  // Coins kept back per tile the rack is still short of a 7-letter word,
+  // so one big bid can't leave the bot unable to finish anything.
+  reservePerTile: number;
+  // Most of the balance one bid may be.
+  maxBidShare: number;
+  // A word under 7 letters is played only in the last `shortWordWindow`
+  // auctions, and only when playing it beats holding by `holdMargin`, a
+  // fraction that shrinks to 0 as the match ends.
+  shortWordWindow: number;
+  holdMargin: number;
+  // With fewer coins than `cashInBalance` the bot can't buy its way to a
+  // longer word, so it plays its best word worth `cashInReward` or more
+  // whenever it has one, and spends the reward on more tiles.
+  cashInBalance: number;
+  cashInReward: number;
+  // Samples for deciding whether to play a short word, which takes several
+  // outlooks: fewer than for bids, since nothing waits on the answer.
+  playSamples: number;
+}
+
+// Median price to beat per letter (the best bid of the other five bots)
+// over 122 lobby matches of real bots, 330-451, leaving out the last two
+// auctions of each match: roughly what it takes to outbid the field.
+export const MARKET_PRICES: readonly number[] = [
+  13, 19, 21, 16, 14, 23, 15, 26, 13, 33, 28, 13, 20, 13, 12, 20, 36, 14, 15,
+  12, 13, 21, 20, 37, 26, 44,
+];
+
+// Price to beat relative to the letter's median, by auctions left after
+// the auction (index 0 is the last auction), from the same matches,
+// smoothed over 5 auctions. Openings run ~17% dear, auctions 18-55 ~8%
+// cheap, and 56-65 dear again as several bots dump their coins; nobody
+// wants the last tile, which can't be played.
+export const PRICE_PHASE: readonly number[] = [
+  0.15, 1.08, 1.17, 1.19, 1.17, 1.19, 1.15, 1.15, 1.15, 1.15, 1.08, 1.06, 1, 1,
+  0.95, 0.93, 0.93, 0.95, 0.94, 0.94, 0.95, 0.95, 0.95, 0.95, 0.93, 0.92, 0.92,
+  0.92, 0.91, 0.91, 0.92, 0.92, 0.92, 0.92, 0.92, 0.92, 0.92, 0.92, 0.93, 0.93,
+  0.95, 0.95, 0.93, 0.93, 0.93, 0.93, 0.93, 0.93, 0.94, 0.96, 1, 1, 1, 1, 1, 1,
+  1.06, 1.07, 1.08, 1.09, 1.11, 1.14, 1.15, 1.15, 1.17, 1.17, 1.18, 1.17,
+];
+
+// The average phase multiplier over the auctions a purchase could come from.
+function phaseOver(
+  auctionsLeft: number,
+  horizon: number,
+  params: Params,
+): number {
+  if (horizon <= 0 || params.phaseStrength === 0) return 1;
+  const { phase } = params;
+  let sum = 0;
+  for (let k = auctionsLeft - 1; k >= auctionsLeft - horizon; k--) {
+    sum += phase[Math.min(k, phase.length - 1)]!;
+  }
+  return 1 + params.phaseStrength * (sum / horizon - 1);
+}
+
+export const DEFAULT_PARAMS: Params = {
+  horizon: 12,
+  winRate: 0.3,
+  maxBuys: 3,
+  coinsPerBuy: 0,
+  buildTo: 7,
+  reinvest: 0,
+  speculativeCap: 1,
+  samples: 80,
+  pointsPerCoin: 0.5,
+  prices: MARKET_PRICES,
+  phase: PRICE_PHASE,
+  phaseStrength: 1,
+  spendRate: 1.5,
+  paceMin: 0.6,
+  paceMax: 8,
+  reservePerTile: 0,
+  maxBidShare: 1,
+  shortWordWindow: 20,
+  holdMargin: 0.5,
+  cashInBalance: 25,
+  cashInReward: 15,
+  playSamples: 30,
 };
 
-export interface BidContext {
-  letter: string;        // Letter being auctioned, e.g. "Q"
-  myBalance: number;     // Current balance
-  myRack: Map<string, number>; // Letters you currently own, letter -> count
+// Coins are worth less the more the bot has per auction left to spend them.
+function pace(view: MatchView, params: Params): number {
+  const perAuction = view.balance / (view.auctionsLeft + 1);
+  return Math.min(
+    params.paceMax,
+    Math.max(params.paceMin, perAuction / params.spendRate),
+  );
 }
 
-/**
- * Decide how much to bid for `letter`. Return 0 to skip.
- * Default: bid the letter's face value plus a small premium if you don't have one yet.
- */
-export function decideBid(ctx: BidContext): number {
-  const value = LETTER_VALUE[ctx.letter] ?? 1;
-  const have = ctx.myRack.get(ctx.letter) ?? 0;
-  // Pay slightly above face value for letters you don't have yet.
-  const want = have === 0 ? value + 2 : Math.max(1, value);
-  return Math.min(want, Math.max(0, ctx.myBalance));
+function pointsPerCoin(view: MatchView, params: Params): number {
+  return params.pointsPerCoin / pace(view, params);
 }
 
-export interface WordContext {
-  myRack: Map<string, number>;
-  dictionary: string[]; // Sorted uppercase list, shared at startup
+// What a word's reward is worth now, per point: more early in the match,
+// when the coins it returns can still buy tiles for more words.
+function reinvestment(view: MatchView, params: Params): number {
+  const matchLength = params.phase.length - 1;
+  return 1 + params.reinvest * Math.min(1, view.auctionsLeft / matchLength);
 }
 
-/**
- * Try to form a word using letters from `myRack`.
- * Return the word (uppercase) to play, or null to skip.
- *
- * Default strategy: greedily find the longest playable word in the dictionary.
- *
- * Keep this fast. The bot runs it on every rack change, and while it runs
- * the bot can't see the match move on: a search that takes longer than an
- * auction means bids on closed auctions and words from spent letters.
- */
-export function chooseWord(ctx: WordContext): string | null {
-  let tiles = 0;
-  for (const count of ctx.myRack.values()) tiles += count;
+export interface MatchView {
+  rack: Counts;
+  // Tiles not yet seen this match, that later auctions could reveal.
+  pool: Counts;
+  // Auctions still to come after the open one (0: the open one is last).
+  auctionsLeft: number;
+  balance: number;
+}
 
-  // The dictionary is longest first, so the first word we can spell is
-  // the longest.
-  for (const word of ctx.dictionary) {
-    if (word.length <= tiles && canSpell(word, ctx.myRack)) return word;
+export function outlookFor(
+  lex: Lexicon,
+  view: MatchView,
+  params: Params = DEFAULT_PARAMS,
+  rng?: () => number,
+): Outlook {
+  let horizon = Math.min(params.horizon, view.auctionsLeft);
+  let buys = Math.min(params.maxBuys, Math.round(horizon * params.winRate));
+  // Three buys from a nearly empty rack only reach short words, which pay
+  // less than their tiles cost, so every tile would look worthless: after
+  // its first word the bot once bid 0 for 14 auctions holding 118 coins.
+  // Plan instead to rebuild a long word, over as many auctions as winning
+  // its tiles should take.
+  const toBuild = params.buildTo - total(view.rack);
+  if (toBuild > buys) {
+    horizon = Math.min(
+      view.auctionsLeft,
+      Math.max(horizon, Math.ceil(toBuild / params.winRate)),
+    );
+    buys = Math.min(toBuild, horizon);
   }
-  return null;
+  // A broke bot can't buy the rest of a word, so it shouldn't hold out for
+  // one. (With 10 coins it once sat on EEGPQRU for 20 auctions waiting for
+  // a long Q word, then played QUEER at the very end.)
+  if (params.coinsPerBuy > 0) {
+    buys = Math.min(buys, Math.floor(view.balance / params.coinsPerBuy));
+  }
+  // Tiles still to buy will come from the next `horizon` auctions, at
+  // those auctions' prices.
+  const ppc =
+    pointsPerCoin(view, params) * phaseOver(view.auctionsLeft, horizon, params);
+  // Rewards worth `boost` each point now: the same as tiles costing
+  // 1/boost as much, with every value then scaled back up by `boost`.
+  const boost = reinvestment(view, params);
+  const look = outlook(
+    lex,
+    view.rack,
+    view.pool,
+    {
+      horizon,
+      buys,
+      samples: params.samples,
+      cost: params.prices.map((p) => (p * ppc) / boost),
+    },
+    rng,
+  );
+  return {
+    hold: look.hold * boost,
+    letterValue: look.letterValue.map((v) => v * boost),
+    completes: look.completes,
+  };
 }
 
-// Whether `rack` has every letter of `word`, counting repeats.
-function canSpell(word: string, rack: Map<string, number>): boolean {
-  const used: Record<string, number> = {};
-  for (const c of word) {
-    used[c] = (used[c] ?? 0) + 1;
-    if (used[c] > (rack.get(c) ?? 0)) return false;
+// How much to bid for `letter`. `look` is the outlook for this view, before
+// the letter is won.
+export function bidFor(
+  view: MatchView,
+  letter: string,
+  look: Outlook,
+  params: Params = DEFAULT_PARAMS,
+): number {
+  // The match ends as the last auction closes, before its tile can be played.
+  if (view.auctionsLeft <= 0) return 0;
+  const l = letterIndex(letter);
+  const value = look.letterValue[l] ?? 0;
+  let bid = Math.round(value / pointsPerCoin(view, params));
+  // A tile that only might fit a word later is worth no more than what it
+  // usually costs: bidding past that bought high letters that never got
+  // played, leaving too few coins for the letters the rack needed.
+  if (params.speculativeCap > 0) {
+    if (!look.completes[l]) {
+      const k = Math.min(view.auctionsLeft, params.phase.length - 1);
+      const phase = 1 + params.phaseStrength * (params.phase[k]! - 1);
+      const cap = params.speculativeCap * params.prices[l]! * phase;
+      bid = Math.min(bid, Math.round(cap));
+    }
   }
-  return true;
+  // Pacing makes coins look cheap whenever the bot is flush, but the
+  // letter is only worth `value` if the bot can still buy the rest of the
+  // word. Keep enough back for the tiles it would still lack, given this
+  // one. (An empty rack bidding 84 on a Z once left it 4 coins for the
+  // last 26 auctions.)
+  const short = Math.min(
+    view.auctionsLeft,
+    Math.max(0, 7 - (total(view.rack) + 1)),
+  );
+  const affordable = Math.min(
+    view.balance - params.reservePerTile * short,
+    Math.floor(view.balance * params.maxBidShare),
+  );
+  return Math.max(0, Math.min(bid, affordable, view.balance));
+}
+
+// Words to play now, in order. Each is spelled from what the previous ones
+// leave on the rack.
+export function choosePlays(
+  lex: Lexicon,
+  view: MatchView,
+  params: Params = DEFAULT_PARAMS,
+  rng?: () => number,
+): Word[] {
+  if (view.auctionsLeft <= 0) return dump(lex, view.rack);
+  const plays: Word[] = [];
+  let rack = view.rack;
+  for (let n = 0; n < 4; n++) {
+    const word = choosePlay(lex, { ...view, rack }, params, rng);
+    if (!word) break;
+    plays.push(word);
+    rack = without(rack, word);
+  }
+  return plays;
+}
+
+function choosePlay(
+  lex: Lexicon,
+  view: MatchView,
+  params: Params,
+  rng?: () => number,
+): Word | undefined {
+  const words = playable(lex, view.rack);
+  if (words.length === 0) return undefined;
+  const boost = reinvestment(view, params);
+  // A 7+ letter word already earns the top multiplier: play one now. Of
+  // several, take the one worth most net of the tiles it uses up, at what
+  // they'd cost to buy back: a tile kept saves a purchase. (Comparing
+  // full outlooks of the leftovers instead once held a bid back 421 ms.)
+  const long = words.filter((w) => w.text.length >= 7);
+  if (long.length > 0) {
+    const ppc = pointsPerCoin(view, params);
+    let best = long[0]!;
+    let bestValue = -Infinity;
+    for (const w of long) {
+      let value = w.reward * boost;
+      for (const l of w.letters) value -= params.prices[l]! * ppc;
+      if (value > bestValue) {
+        best = w;
+        bestValue = value;
+      }
+    }
+    return best;
+  }
+
+  // Broke, the bot can't buy the tiles a longer word needs, so holding out
+  // for one just freezes it: in 15 of 22 live cases its last word had been
+  // spellable for up to 45 auctions, and it was played when its reward
+  // could no longer buy anything. Cash in, unless one tile it can still
+  // afford would finish a 7-letter word.
+  const cashIn = words[0]!;
+  if (view.balance < params.cashInBalance && cashIn.reward >= params.cashInReward) {
+    const oneShort =
+      total(view.rack) >= 6 &&
+      outlookFor(lex, view, { ...params, samples: 1 }, rng).completes.some(
+        (c, l) => c === 1 && view.balance >= params.prices[l]!,
+      );
+    if (!oneShort) return cashIn;
+  }
+  if (view.auctionsLeft > params.shortWordWindow) return undefined;
+
+  // Otherwise play only if the word plus what the rest can still become
+  // clearly beats holding everything for a longer word. This takes several
+  // outlooks, so it samples less than a bid does.
+  params = { ...params, samples: params.playSamples };
+  const hold = outlookFor(lex, view, params, rng).hold;
+  const margin =
+    params.holdMargin * Math.min(1, view.auctionsLeft / params.shortWordWindow);
+  let best: Word | undefined;
+  let bestValue = hold * (1 + margin);
+  for (const w of words.slice(0, 3)) {
+    const rest = without(view.rack, w);
+    const value =
+      w.reward * boost +
+      outlookFor(lex, { ...view, rack: rest }, params, rng).hold;
+    if (value > bestValue) {
+      best = w;
+      bestValue = value;
+    }
+  }
+  return best;
 }
